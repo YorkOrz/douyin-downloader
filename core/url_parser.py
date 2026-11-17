@@ -30,6 +30,10 @@ class URLParser:
             sec_uid = URLParser._extract_user_id(url)
             if sec_uid:
                 result["sec_uid"] = sec_uid
+            parsed_query = parse_qs(urlparse(url).query)
+            show_tab = (parsed_query.get("showTab") or parsed_query.get("tab") or [None])[0]
+            if show_tab:
+                result["show_tab"] = str(show_tab).lower()
 
         elif url_type == "collection":
             mix_id = URLParser._extract_mix_id(url)

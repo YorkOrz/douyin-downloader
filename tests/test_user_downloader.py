@@ -898,3 +898,39 @@ def test_browser_backend_missing_reason_matches_the_runtime(tmp_path, monkeypatc
 
     monkeypatch.delattr(sys, "frozen", raising=False)
     assert "playwright" in downloader._browser_backend_missing_reason()
+
+
+def test_browser_fallback_keeps_cocreator_posts(tmp_path):
+    target_sec_uid = "sec_target"
+    other_sec_uid = "sec_other"
+
+    class _CoopBrowserAPI(_FakeAPIClient):
+        def pop_browser_post_aweme_items(self):
+            return {
+                "aweme_coop_api": {
+                    "aweme_id": "aweme_coop_api",
+                    "author": {"sec_uid": other_sec_uid, "nickname": "Partner"},
+                    "cooperation_info": {"co_creators": [{"sec_uid": target_sec_uid}]},
+                }
+            }
+
+        async def collect_user_post_ids_via_browser(self, *_args, **_kwargs):
+            return ["aweme_coop_api", "aweme_coop_detail", "aweme_unrelated"]
+
+        async def get_video_detail(self, aweme_id, **_kwargs):
+            if aweme_id == "aweme_coop_detail":
+                return {
+                    "aweme_id": "aweme_coop_detail",
+                    "author": {"sec_uid": other_sec_uid},
+                    "cooperation_info": {"co_creators": [{"sec_uid": target_sec_uid}]},
+                }
+            return {
+                "aweme_id": aweme_id,
+                "author": {"sec_uid": other_sec_uid},
+            }
+
+    downloader = _build_downloader(tmp_path, _CoopBrowserAPI(), browser_enabled=True)
+    aweme_list = []
+    asyncio.run(downloader._recover_user_post_with_browser(target_sec_uid, {"sec_uid": target_sec_uid}, aweme_list))
+    collected_ids = [item["aweme_id"] for item in aweme_list]
+    assert collected_ids == ["aweme_coop_api", "aweme_coop_detail"]

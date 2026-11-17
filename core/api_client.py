@@ -383,6 +383,8 @@ class DouyinAPIClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._browser_post_aweme_items: Dict[str, Dict[str, Any]] = {}
         self._browser_post_stats: Dict[str, int] = {}
+        self._browser_like_aweme_items: Dict[str, Dict[str, Any]] = {}
+        self._browser_like_stats: Dict[str, int] = {}
         selected_ua = random.choice(_USER_AGENT_POOL)
         self.headers = {
             "User-Agent": selected_ua,
@@ -1910,6 +1912,95 @@ class DouyinAPIClient:
             logger.warning("Failed to request Electron homepage screenshot: %s", exc)
             return False
 
+    async def _dismiss_browser_popups(self, page) -> bool:
+        """Dismiss login-save prompts or modal overlays that block scrolling."""
+        if not callable(getattr(page, "evaluate", None)):
+            return False
+        try:
+            dismissed = await page.evaluate(
+                r"""() => {
+                    let clicked = false;
+                    const buttons = Array.from(document.querySelectorAll('button, div[role="button"]'));
+                    for (const btn of buttons) {
+                        const text = (btn.innerText || btn.textContent || '').trim();
+                        if (text === '取消' || text === '保存' || text.includes('保存登录信息')) {
+                            btn.click();
+                            clicked = true;
+                            break;
+                        }
+                    }
+                    const closeBtns = Array.from(document.querySelectorAll('.dy-account-close, [class*="login-guide"] [class*="close"], [class*="modal"] [class*="close"]'));
+                    for (const el of closeBtns) {
+                        if (el && typeof el.click === 'function' && el.offsetParent !== null) {
+                            el.click();
+                            clicked = true;
+                        }
+                    }
+                    return clicked;
+                }"""
+            )
+            if dismissed:
+                await page.wait_for_timeout(400)
+                return True
+        except Exception as exc:
+            logger.debug("Dismiss browser popup skipped: %s", exc)
+        return False
+
+    async def _scroll_feed_once(self, page, delta_y: int = 3800) -> bool:
+        """Scroll the main feed container and move mouse out of fixed sidebar."""
+        target_x, target_y, scrolled = 900.0, 500.0, False
+        if callable(getattr(page, "evaluate", None)):
+            try:
+                pos = await page.evaluate(
+                    """(dy) => {
+                        let best = null;
+                        let bestArea = 0;
+                        for (const el of document.querySelectorAll('*')) {
+                            const st = getComputedStyle(el);
+                            if ((st.overflowY === 'auto' || st.overflowY === 'scroll')
+                                && el.scrollHeight > el.clientHeight + 50) {
+                                const r = el.getBoundingClientRect();
+                                const area = r.width * r.height;
+                                if (r.width >= 300 && area > bestArea) {
+                                    best = el;
+                                    bestArea = area;
+                                }
+                            }
+                        }
+                        let moved = false;
+                        let cx = 900;
+                        let cy = 500;
+                        if (best) {
+                            const r = best.getBoundingClientRect();
+                            cx = Math.max(200, Math.min(window.innerWidth - 40, r.left + r.width / 2));
+                            cy = Math.max(120, Math.min(window.innerHeight - 40, r.top + r.height / 2));
+                            const before = best.scrollTop;
+                            best.scrollTop += dy;
+                            if (best.scrollTop !== before) {
+                                moved = true;
+                            }
+                        }
+                        const winBefore = window.scrollY;
+                        window.scrollBy(0, dy);
+                        if (window.scrollY !== winBefore) {
+                            moved = true;
+                        }
+                        return {cx, cy, moved};
+                    }""",
+                    delta_y,
+                )
+                if isinstance(pos, dict):
+                    target_x = float(pos.get("cx") or 900.0)
+                    target_y = float(pos.get("cy") or 500.0)
+                    scrolled = bool(pos.get("moved"))
+            except Exception as exc:
+                logger.debug("Container scroll helper skipped: %s", exc)
+
+        if callable(getattr(page.mouse, "move", None)):
+            await page.mouse.move(target_x, target_y)
+        await page.mouse.wheel(0, delta_y)
+        return scrolled
+
     async def collect_user_post_ids_via_browser(
         self,
         sec_uid: str,
@@ -1935,6 +2026,7 @@ class DouyinAPIClient:
         post_api_seen: set[str] = set()
         post_api_aweme_items: Dict[str, Dict[str, Any]] = {}
         post_api_page_hits = 0
+        post_api_has_more: Optional[bool] = None
         self._browser_post_aweme_items = {}
         self._browser_post_stats = {}
 
@@ -1988,7 +2080,7 @@ class DouyinAPIClient:
             pending_response_tasks: List[asyncio.Task] = []
 
             async def _handle_response(response):
-                nonlocal post_api_page_hits
+                nonlocal post_api_page_hits, post_api_has_more
                 url = response.url or ""
                 if "/aweme/v1/web/aweme/post/" not in url:
                     return
@@ -1999,6 +2091,7 @@ class DouyinAPIClient:
                 aweme_items = data.get("aweme_list") if isinstance(data, dict) else None
                 if isinstance(aweme_items, list):
                     post_api_page_hits += 1
+                    post_api_has_more = bool(data.get("has_more"))
                     extracted: List[str] = []
                     for item in aweme_items:
                         if not isinstance(item, dict):
@@ -2072,6 +2165,7 @@ class DouyinAPIClient:
                             break
                         await page.wait_for_timeout(1000)
 
+                    await self._dismiss_browser_popups(page)
                     stable_rounds = 0
                     max_scroll_rounds = max(1, int(max_scrolls))
                     idle_stop_rounds = max(1, int(idle_rounds))
@@ -2080,20 +2174,25 @@ class DouyinAPIClient:
                         if page.is_closed():
                             logger.warning("Browser page closed during scrolling")
                             break
-                        await page.mouse.wheel(0, 3800)
+                        await self._dismiss_browser_popups(page)
+                        scrolled = await self._scroll_feed_once(page, 3800)
                         await page.wait_for_timeout(1200)
 
                         before = len(ids)
                         _merge(await self._extract_aweme_ids_from_page(page))
-                        if len(ids) == before:
-                            stable_rounds += 1
-                        else:
+                        if len(ids) > before:
                             stable_rounds = 0
+                        else:
+                            stable_rounds += 1
 
                         if expected_count > 0 and len(ids) >= expected_count:
                             break
-                        if expected_count <= 0 and stable_rounds >= idle_stop_rounds:
-                            break
+                        if expected_count <= 0:
+                            if post_api_has_more is False and len(ids) == before and stable_rounds >= min(2, idle_stop_rounds):
+                                break
+                            limit_rounds = max(idle_stop_rounds, 6) if (post_api_has_more is True or scrolled) else idle_stop_rounds
+                            if stable_rounds >= limit_rounds:
+                                break
                 except Exception as exc:
                     logger.warning(
                         "Browser collection interrupted, use collected ids so far: %s",
@@ -2146,18 +2245,229 @@ class DouyinAPIClient:
         self._browser_post_stats = {}
         return stats
 
-    def _browser_cookie_payload(self) -> List[Dict[str, str]]:
+    async def collect_user_like_ids_via_browser(
+        self,
+        sec_uid: str,
+        expected_count: int = 0,
+        headless: bool = True,
+        max_scrolls: int = 240,
+        idle_rounds: int = 8,
+        wait_timeout_seconds: int = 600,
+    ) -> List[str]:
+        browser_started = time.monotonic()
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            logger.warning("Playwright not available, browser fallback disabled: %s", exc)
+            return []
+
+        target_url = f"{self.BASE_URL}/user/{sec_uid}?showTab=like"
+        timeout_ms = max(30, int(wait_timeout_seconds)) * 1000
+        ids: List[str] = []
+        seen: set[str] = set()
+        like_api_ids: List[str] = []
+        like_api_seen: set[str] = set()
+        like_api_aweme_items: Dict[str, Dict[str, Any]] = {}
+        like_api_page_hits = 0
+        like_api_has_more: Optional[bool] = None
+        self._browser_like_aweme_items = {}
+        self._browser_like_stats = {}
+
+        def _merge(new_ids: List[str]):
+            for aweme_id in new_ids:
+                if aweme_id and aweme_id not in seen:
+                    seen.add(aweme_id)
+                    ids.append(aweme_id)
+
+        logger.warning(
+            "喜欢列表API受限，启动浏览器兜底采集：target=%s expected_count=%s "
+            "headless=%s max_scrolls=%s idle_rounds=%s timeout_s=%s",
+            safe_log_url(target_url),
+            expected_count,
+            headless,
+            max_scrolls,
+            idle_rounds,
+            wait_timeout_seconds,
+        )
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=headless,
+                channel="chrome",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=self.headers.get("User-Agent", ""),
+                locale="zh-CN",
+                viewport={"width": 1600, "height": 900},
+            )
+            await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            cookies = self._browser_cookie_payload()
+            if cookies:
+                await context.add_cookies(cookies)
+
+            page = await context.new_page()
+            pending_response_tasks: List[asyncio.Task] = []
+
+            async def _handle_response(response):
+                nonlocal like_api_page_hits, like_api_has_more
+                url = response.url or ""
+                if "/aweme/v1/web/aweme/favorite/" not in url and "/aweme/v1/web/aweme/like/" not in url:
+                    return
+                # 严格校验 sec_uid，防止串台抓到登录用户自己的点赞
+                if sec_uid and f"sec_user_id={sec_uid}" not in url:
+                    logger.debug("忽略非目标用户的喜欢请求: target=%s, url=%s", sec_uid, url[:120])
+                    return
+
+                logger.info("捕获到喜欢列表网络响应: status=%s, url=%s", response.status, url[:120])
+                try:
+                    data = await response.json()
+                except Exception as e:
+                    logger.warning("解析喜欢列表 JSON 失败: %s", e)
+                    return
+                aweme_items = data.get("aweme_list") if isinstance(data, dict) else None
+                logger.info("喜欢列表 JSON 包含作品数: %s", len(aweme_items) if isinstance(aweme_items, list) else 0)
+                if isinstance(aweme_items, list):
+                    like_api_page_hits += 1
+                    like_api_has_more = bool(data.get("has_more"))
+                    extracted: List[str] = []
+                    for item in aweme_items:
+                        if not isinstance(item, dict):
+                            continue
+                        aweme_id = item.get("aweme_id")
+                        if not aweme_id:
+                            continue
+                        aweme_id_str = str(aweme_id)
+                        extracted.append(aweme_id_str)
+                        if aweme_id_str not in like_api_aweme_items:
+                            like_api_aweme_items[aweme_id_str] = item
+                    _merge(extracted)
+                    for aweme_id in extracted:
+                        if aweme_id not in like_api_seen:
+                            like_api_seen.add(aweme_id)
+                            like_api_ids.append(aweme_id)
+
+            page.on("response", _handle_response)
+
+            try:
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    logger.warning("Browser goto timeout or error: %s", exc)
+
+                await page.wait_for_timeout(2000)
+
+                await self._dismiss_browser_popups(page)
+
+                # 确保切换到“喜欢”标签页
+                try:
+                    await page.evaluate(r"""() => {
+                        const elements = Array.from(document.querySelectorAll('span, div, p, a'));
+                        for (const el of elements) {
+                            const text = (el.innerText || el.textContent || '').trim();
+                            if (text.startsWith('\u559c\u6b22') || text.includes('\u559c\u6b22')) {
+                                if (el.children.length <= 2) {
+                                    el.click();
+                                    break;
+                                }
+                            }
+                        }
+                    }""")
+                    await page.wait_for_timeout(1500)
+                except Exception as e:
+                    logger.debug("Click like tab ignored: %s", e)
+
+                await self._dismiss_browser_popups(page)
+                stable_rounds = 0
+                max_scroll_rounds = max(1, int(max_scrolls))
+                idle_stop_rounds = max(1, int(idle_rounds))
+
+                for _ in range(max_scroll_rounds):
+                    if page.is_closed():
+                        break
+                    await self._dismiss_browser_popups(page)
+                    scrolled = await self._scroll_feed_once(page, 3500)
+                    await page.wait_for_timeout(2000)
+
+                    before = len(ids)
+                    _merge(await self._extract_aweme_ids_from_page(page))
+                    if len(ids) > before:
+                        stable_rounds = 0
+                    else:
+                        stable_rounds += 1
+
+                    if expected_count > 0 and len(ids) >= expected_count:
+                        break
+                    if expected_count <= 0:
+                        if like_api_has_more is False and len(ids) == before and stable_rounds >= min(2, idle_stop_rounds):
+                            break
+                        limit_rounds = max(idle_stop_rounds, 6) if (like_api_has_more is True or scrolled) else idle_stop_rounds
+                        if stable_rounds >= limit_rounds:
+                            break
+
+                await page.wait_for_timeout(2000)
+            finally:
+                if pending_response_tasks:
+                    await asyncio.gather(*pending_response_tasks, return_exceptions=True)
+                try:
+                    browser_cookies = await context.cookies(self.BASE_URL)
+                    self._sync_browser_cookies(browser_cookies)
+                except Exception as exc:
+                    logger.debug("Sync browser cookies skipped: %s", exc)
+                await context.close()
+                await browser.close()
+
+        selected_ids: List[str] = []
+        selected_seen: set[str] = set()
+        for aweme_id in like_api_ids + ids:
+            if aweme_id and aweme_id not in selected_seen:
+                selected_seen.add(aweme_id)
+                selected_ids.append(aweme_id)
+
+        self._browser_like_aweme_items = like_api_aweme_items
+        self._browser_like_stats = {
+            "merged_ids": len(ids),
+            "like_api_ids": len(like_api_ids),
+            "selected_ids": len(selected_ids),
+            "like_items": len(like_api_aweme_items),
+            "like_pages": like_api_page_hits,
+        }
+        logger.warning(
+            "浏览器兜底采集喜欢列表完成: duration_ms=%s selected=%s like_items=%s like_pages=%s",
+            _elapsed_ms(browser_started),
+            len(selected_ids),
+            len(like_api_aweme_items),
+            like_api_page_hits,
+        )
+        return selected_ids
+
+    def pop_browser_like_aweme_items(self) -> Dict[str, Dict[str, Any]]:
+        items = self._browser_like_aweme_items
+        self._browser_like_aweme_items = {}
+        return items
+
+    def pop_browser_like_stats(self) -> Dict[str, int]:
+        stats = self._browser_like_stats
+        self._browser_like_stats = {}
+        return stats
+
+    def _browser_cookie_payload(self, include_auth: bool = True) -> List[Dict[str, str]]:
         payload: List[Dict[str, str]] = []
         for name, value in self.cookies.items():
             if not name:
                 continue
-            if name in self._BROWSER_COOKIE_BLOCKLIST:
+            if not include_auth and name in self._BROWSER_COOKIE_BLOCKLIST:
                 continue
             payload.append(
                 {
                     "name": str(name),
                     "value": str(value or ""),
-                    "url": f"{self.BASE_URL}/",
+                    "domain": ".douyin.com",
+                    "path": "/",
                 }
             )
         return payload

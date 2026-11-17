@@ -356,8 +356,32 @@ class BaseDownloader(ABC):
     async def download(self, parsed_url: Dict[str, Any]) -> DownloadResult:
         pass
 
-    async def _should_download(self, aweme_id: str, *, force: bool = False) -> bool:
+    async def _should_download(
+        self,
+        aweme_id: str,
+        *,
+        force: bool = False,
+        target_dir: Optional[Path] = None,
+    ) -> bool:
         if force:
+            return True
+
+        if target_dir is not None and target_dir.exists():
+            # 优先精确检查目标模式目录下是否存在该作品有效媒体文件
+            has_in_target = False
+            for p in target_dir.glob(f"*{aweme_id}*"):
+                if p.is_file() and p.suffix.lower() in self._local_media_suffixes:
+                    if not p.stem.lower().endswith(("_cover", "_avatar", "_music")):
+                        try:
+                            if p.stat().st_size > 0:
+                                has_in_target = True
+                                break
+                        except OSError:
+                            pass
+            if has_in_target:
+                logger.info("Aweme %s already exists in %s, skipping", aweme_id, target_dir)
+                return self._note_item_reason(aweme_id, item_reasons.SKIP_LOCAL_FILE_EXISTS)
+            # 目标目录缺失该文件，允许重新下载
             return True
 
         await self._ensure_local_aweme_index()
@@ -376,8 +400,6 @@ class BaseDownloader(ABC):
                 )
                 return self._note_item_reason(aweme_id, item_reasons.SKIP_HISTORY_EXISTS)
         except Exception as exc:
-            # 历史库只是增量判定的可选兜底；状态不明时宁可补下，不能把作品
-            # 永久误判为已下载。
             logger.warning(
                 "Download history lookup failed for aweme %s, downloading it: %s",
                 aweme_id,

@@ -228,18 +228,29 @@ class Database:
         self._initialized = True
 
     async def is_downloaded(self, aweme_id: str) -> bool:
-        # Row existence is NOT enough: rows can exist with an empty
-        # file_path (e.g. synced from the desktop sibling's my-content
-        # feature). Treating those as "downloaded" would make like-mode
-        # incremental batches stop at the first such row.
         db = await self._get_conn()
         cursor = await db.execute(
             "SELECT id FROM aweme WHERE aweme_id = ? "
             "AND file_path IS NOT NULL AND file_path != ''",
-            (aweme_id,),
+            (str(aweme_id),),
         )
         result = await cursor.fetchone()
-        return result is not None
+        if result is not None:
+            return True
+
+        # 兼容老版 data.db 中的历史下载记录表 (t_user_post, t_user_like, t_mix, t_music)
+        try:
+            legacy_cursor = await db.execute(
+                "SELECT 1 FROM t_user_like WHERE aweme_id = ? "
+                "UNION SELECT 1 FROM t_user_post WHERE aweme_id = ? LIMIT 1",
+                (str(aweme_id), str(aweme_id)),
+            )
+            if await legacy_cursor.fetchone() is not None:
+                return True
+        except Exception:
+            pass
+
+        return False
 
     # Preserving upsert: metadata-ish fields always update, but download
     # artifacts (file_path / metadata / download_time) and enrichments
@@ -321,6 +332,18 @@ class Database:
             self._AWEME_UPSERT_SQL,
             self._aweme_upsert_row(aweme_data, sec_uid, int(datetime.now().timestamp())),
         )
+        try:
+            aid = str(aweme_data.get("aweme_id") or "")
+            suid = str(sec_uid or "")
+            raw = str(aweme_data.get("metadata") or "")
+            fpath = str(aweme_data.get("file_path") or "")
+            if aid and suid:
+                if "\\like" in fpath or "/like" in fpath:
+                    await db.execute("INSERT OR IGNORE INTO t_user_like (sec_uid, aweme_id, rawdata) VALUES (?, ?, ?)", (suid, aid, raw))
+                else:
+                    await db.execute("INSERT OR IGNORE INTO t_user_post (sec_uid, aweme_id, rawdata) VALUES (?, ?, ?)", (suid, aid, raw))
+        except Exception:
+            pass
         await db.commit()
 
     async def add_aweme_batch(self, items: List[Dict[str, Any]]) -> None:

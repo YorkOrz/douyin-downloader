@@ -133,11 +133,61 @@ class FileManager:
 
     # 作者目录层可选风格（与 DEFAULT_CONFIG["author_dir"]、REST SettingsPatch
     # 的 Literal、前端下拉三处保持一致）。
-    _AUTHOR_DIR_STYLES = ("nickname", "sec_uid", "nickname_uid", "user_sec_uid")
+    _AUTHOR_DIR_STYLES = ("nickname", "sec_uid", "nickname_uid", "user_sec_uid", "user_nickname_sec_uid")
 
     def __init__(self, base_path: str = "./Downloaded"):
         self.base_path = Path(base_path)
         self.base_path.mkdir(parents=True, exist_ok=True)
+
+    def _find_existing_author_dir(
+        self,
+        author_sec_uid: Optional[str],
+        author_name: str = "",
+    ) -> Optional[Path]:
+        """优先复用已存在的匹配该 sec_uid 的历史目录，杜绝因改名或特殊符号造成目录分裂。"""
+        if not author_sec_uid or not self.base_path.exists():
+            return None
+
+        clean_sec_uid = str(author_sec_uid).strip()
+        if not clean_sec_uid or clean_sec_uid == "self":
+            return None
+
+        candidates = []
+        try:
+            for entry in self.base_path.iterdir():
+                if not entry.is_dir():
+                    continue
+                name = entry.name
+                if name.endswith(f"_{clean_sec_uid}") or name == clean_sec_uid or name == f"user_{clean_sec_uid}":
+                    candidates.append(entry)
+        except Exception as exc:
+            logger.debug("Failed to list base_path for existing author dirs: %s", exc)
+            return None
+
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            logger.info("Found existing author directory for sec_uid=%s: %s", clean_sec_uid, candidates[0].name)
+            return candidates[0]
+
+        clean_author = re.sub(r"[\U00010000-\U0010ffff\u2000-\u200f\u2028-\u202f\u3000\s\W_]+", "", author_name or "").lower()
+
+        def _dir_score(p: Path):
+            has_bad_chars = bool(re.search(r"[\U00010000-\U0010ffff\u2000-\u200f\u2028-\u202f\u3000]", p.name))
+            is_clean = 0 if has_bad_chars else 1
+            norm_p = re.sub(r"[\U00010000-\U0010ffff\u2000-\u200f\u2028-\u202f\u3000\s\W_]+", "", p.name).lower()
+            name_match = 1 if (clean_author and clean_author in norm_p) else 0
+            try:
+                cnt = sum(1 for _ in p.iterdir())
+            except Exception:
+                cnt = 0
+            return (name_match, is_clean, 1 if cnt > 0 else 0, p.stat().st_mtime if p.exists() else 0)
+
+        candidates.sort(key=_dir_score, reverse=True)
+        winner = candidates[0]
+        logger.info("Reusing existing historical directory for sec_uid=%s: %s", clean_sec_uid, winner.name)
+        return winner
 
     def get_author_dir(
         self,
@@ -147,6 +197,10 @@ class FileManager:
         author_dir_style: str = "nickname",
     ) -> Path:
         """Return (and create) the configured author-level directory."""
+        existing_dir = self._find_existing_author_dir(author_sec_uid, author_name)
+        if existing_dir is not None:
+            return existing_dir
+
         safe_author = self._compose_author_dir(
             author_name,
             author_sec_uid,
@@ -285,6 +339,13 @@ class FileManager:
                 )
                 return nickname_dir
             return f"user_{cls._sanitize_sec_uid_token(sec_uid)}"
+
+        if style == "user_nickname_sec_uid":
+            clean_nick = re.sub(r"[\U00010000-\U0010ffff\u2000-\u200f\u2028-\u202f\u3000\ufeff]+", "", nickname_dir).strip()
+            clean_nick = sanitize_filename(clean_nick) or "unknown"
+            if not sec_uid:
+                return f"user_{clean_nick}"
+            return f"user_{clean_nick}_{cls._sanitize_sec_uid_token(sec_uid)}"
 
         # style == "nickname_uid"
         if not sec_uid:

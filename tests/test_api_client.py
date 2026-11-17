@@ -306,6 +306,33 @@ def test_browser_fallback_caps_warmup_wait(monkeypatch):
     assert client.pop_browser_post_stats() == {}
 
 
+def test_scroll_feed_once_moves_mouse_into_main_container():
+    class _Mouse:
+        def __init__(self):
+            self.moved = None
+            self.wheeled = None
+
+        async def move(self, x, y):
+            self.moved = (x, y)
+
+        async def wheel(self, dx, dy):
+            self.wheeled = (dx, dy)
+
+    class _Page:
+        def __init__(self):
+            self.mouse = _Mouse()
+
+        async def evaluate(self, _script, _dy):
+            return {"cx": 880, "cy": 450, "moved": True}
+
+    client = DouyinAPIClient({"msToken": "token-1"})
+    page = _Page()
+    scrolled = asyncio.run(client._scroll_feed_once(page, 3800))
+    assert scrolled is True
+    assert page.mouse.moved == (880.0, 450.0)
+    assert page.mouse.wheeled == (0, 3800)
+
+
 @pytest.mark.asyncio
 async def test_get_user_post_returns_normalized_dto(monkeypatch):
     client = DouyinAPIClient({"msToken": "token-1"})

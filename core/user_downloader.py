@@ -56,7 +56,7 @@ class UserDownloader(BaseDownloader):
         if not sec_uid:
             raise RuntimeError("无法从链接中解析出用户 ID，请确认链接是否完整")
 
-        modes = self._configured_modes()
+        modes = self._configured_modes(parsed_url)
         if not self._validate_mode_scope(sec_uid, modes):
             return DownloadResult()
 
@@ -108,7 +108,7 @@ class UserDownloader(BaseDownloader):
         """
         result = DownloadResult()
         seen_aweme_ids: Set[str] = set()
-        first_failure: Optional[PageRequestFailedError] = None
+        first_failure: Optional[Exception] = None
         mix_failed = post_skipped = False
         # 合集归属先确定，与界面勾选顺序无关。
         if "mix" in modes:
@@ -122,8 +122,8 @@ class UserDownloader(BaseDownloader):
                 mode_result = await self._download_mode_logged(
                     mode, sec_uid, user_info, seen_aweme_ids
                 )
-            except PageRequestFailedError as exc:
-                logger.warning("User mode aborted by a failed page: mode=%s reason=%s", mode, exc)
+            except Exception as exc:
+                logger.warning("User mode aborted by error: mode=%s reason=%s", mode, exc)
                 first_failure = first_failure or exc
                 mix_failed = mix_failed or mode == "mix"
                 continue
@@ -254,7 +254,14 @@ class UserDownloader(BaseDownloader):
         except Exception as exc:
             logger.warning("Homepage screenshot failed for %s: %s", effective_sec_uid, exc)
 
-    def _configured_modes(self) -> List[str]:
+    def _configured_modes(self, parsed_url: Optional[Dict[str, Any]] = None) -> List[str]:
+        if parsed_url:
+            show_tab = parsed_url.get("show_tab")
+            if show_tab in ("like", "favorite"):
+                return ["like"]
+            if show_tab == "post":
+                return ["post"]
+
         modes_config = self.config.get("mode", ["post"])
         if isinstance(modes_config, str):
             return [modes_config]
@@ -489,6 +496,13 @@ class UserDownloader(BaseDownloader):
             and not bool(increase_config.get(mode))
         )
 
+        target_mode_dir = None
+        try:
+            author_dir = self.file_manager.get_author_dir(author_name, sec_uid=author_sec_uid)
+            target_mode_dir = author_dir / mode if author_dir else None
+        except Exception:
+            target_mode_dir = None
+
         async def _process_aweme(item: Dict[str, Any]):
             aweme_id = item.get("aweme_id")
             collection_dir = (
@@ -498,6 +512,7 @@ class UserDownloader(BaseDownloader):
             if not await self._should_download(
                 str(aweme_id or ""),
                 force=force_download,
+                target_dir=target_mode_dir,
             ):
                 saved = await self._collect_comments_for_existing_aweme(
                     item,
@@ -654,6 +669,7 @@ class UserDownloader(BaseDownloader):
             if index == 1 or index == total_missing or index % 5 == 0:
                 self._progress_update_step("浏览器回补", f"补全详情 {index}/{total_missing}")
 
+            from_post_api = str(aweme_id) in browser_aweme_items
             detail = browser_aweme_items.get(str(aweme_id))
             if not detail:
                 try:
@@ -674,9 +690,9 @@ class UserDownloader(BaseDownloader):
             if not detail:
                 detail_failed += 1
                 continue
-            author = detail.get("author", {}) if isinstance(detail, dict) else {}
-            detail_sec_uid = author.get("sec_uid") if isinstance(author, dict) else None
-            if detail_sec_uid and str(detail_sec_uid) != str(sec_uid):
+            if not from_post_api and not self._matches_target_user_or_cocreator(detail, sec_uid):
+                author = detail.get("author", {}) if isinstance(detail, dict) else {}
+                detail_sec_uid = author.get("sec_uid") if isinstance(author, dict) else None
                 logger.warning(
                     "Skip aweme_id=%s due to mismatched sec_uid (%s)",
                     aweme_id,
@@ -743,3 +759,19 @@ class UserDownloader(BaseDownloader):
             return False
         eligible_items = item_filter(items) if item_filter else items
         return len(eligible_items) >= limit
+
+    @staticmethod
+    def _matches_target_user_or_cocreator(detail: Dict[str, Any], sec_uid: str) -> bool:
+        """Check whether aweme detail belongs to target sec_uid or lists them as co-creator."""
+        author = detail.get("author", {}) if isinstance(detail, dict) else {}
+        detail_sec_uid = author.get("sec_uid") if isinstance(author, dict) else None
+        if not detail_sec_uid or str(detail_sec_uid) == str(sec_uid):
+            return True
+        coop = detail.get("cooperation_info") if isinstance(detail, dict) else None
+        if isinstance(coop, dict):
+            cooperators = coop.get("co_creators") or coop.get("cooperators") or []
+            if isinstance(cooperators, list):
+                for creator in cooperators:
+                    if isinstance(creator, dict) and str(creator.get("sec_uid") or "") == str(sec_uid):
+                        return True
+        return False
